@@ -220,27 +220,91 @@ class ReplayBuffer:
 
     # Sampling
 
-    def _sample_idx(self, L):
-        """Standard Dreamer sampling from the global ring."""
-        valid_idx = False
-        hi = (self.size if self.full else self.idx - L)
-        while not valid_idx:
-            idx = int(self._rng.integers(0, hi))
-            idxs = np.arange(idx, idx + L) % self.size
-            valid_idx = self.idx not in idxs[1:]
-        return idxs
+    def _sample_idx(self, L: int):
+        """
+        Standard Dreamer sampling from the global ring.
+        
+        Dreamer valid-sequence guard: 
+        self.idx (next write slot) must not appear in idxs[1:].
+        Otherwise the sequence crosses the write boundary and may include invalid/overwritten data.
+        """
+
+        # If the buffer is NOT full yet, only indices [0, self.idx) have valid written data.
+        if not self.full:
+            # Highest allowed start index so that start+L-1 is still < self.idx (no reading unwritten slots).
+            hi = self.idx - L
+
+            # If hi <= 0, we don't have enough contiguous data to form a length-L sequence.
+            if hi <= 0:
+                raise RuntimeError(f"Not enough data to sample: idx={self.idx}, L={L}")
+
+            # Keep trying until we find a valid start.
+            while True:
+                # Uniformly sample a start in [0, hi).
+                start = int(self._rng.integers(0, hi))
+
+                # Build the contiguous indices [start, start+1, ..., start+L-1] (no wrap-around).
+                idxs = np.arange(start, start + L, dtype=np.int64)
+
+                # Dreamer valid-sequence guard: self.idx must not appear in the *tail* idxs[1:].
+                if self.idx not in idxs[1:]:
+                    return idxs
+
+        # If the buffer IS full, every slot [0, self.size) has valid data, and wrap-around is allowed.
+        while True:
+            # Uniformly sample a start in [0, self.size).
+            start = int(self._rng.integers(0, self.size))
+
+            # Build the indices with wrap-around using modulo.
+            idxs = (np.arange(start, start + L) % self.size).astype(np.int64)
+
+            # Still enforce Dreamer's "write pointer not inside the sequence tail" rule.
+            if self.idx not in idxs[1:]:
+                return idxs
     
     def _sample_idx_ae(self, L: int):
-        """AE-process sampling: choose start from currently-kept indices, then return temporal window."""
+        """AE-process sampling: choose start from kept indices, then return temporal window."""
+
+        # If we haven't kept anything yet, we cannot sample starts from the kept-set.
         if len(self.loca_indices_flat) == 0:
             raise RuntimeError("No kept indices available yet (loca_indices_flat is empty).")
 
-        valid_idx = False
-        while not valid_idx:
+        # NOT full yet: only [0, self.idx) contains valid written data.
+        if not self.full:
+            # Latest safe start index so the window [start, ..., start+L-1] stays < self.idx.
+            hi = self.idx - L
+
+            # If hi <= 0, we don't have enough contiguous steps to make a length-L sequence.
+            if hi <= 0:
+                raise RuntimeError(f"Not enough data to sample: idx={self.idx}, L={L}")
+
+            # Keep trying until we find a kept start that is also "sequence-valid" in the not-full regime.
+            while True:
+                # Sample a start index uniformly from the kept start pool (Python list).
+                start = self.loca_indices_flat[int(self._rng.integers(0, len(self.loca_indices_flat)))]
+
+                # Reject starts that would run off into unwritten memory (start+L-1 >= self.idx).
+                if start >= hi:
+                    continue
+
+                # Build the contiguous indices without wrap-around (buffer not full yet).
+                idxs = np.arange(start, start + L, dtype=np.int64)
+
+                # Dreamer rule: don't allow the current write pointer inside the sequence tail.
+                if self.idx not in idxs[1:]:
+                    return idxs
+
+        # FULL buffer case: wrap-around is allowed.
+        while True:
+            # Sample a kept start index uniformly from loca_indices_flat.
             start = self.loca_indices_flat[int(self._rng.integers(0, len(self.loca_indices_flat)))]
+
+            # Build the temporal window with wrap-around.
             idxs = (np.arange(start, start + L) % self.size).astype(np.int64)
-            valid_idx = self.idx not in idxs[1:]
-        return idxs
+
+            # Enforce Dreamer "write pointer not in tail" rule.
+            if self.idx not in idxs[1:]:
+                return idxs
 
     def _retrieve_batch(self, idxs, n, L):
         vec_idxs = idxs.transpose().reshape(-1)  # Unroll indices

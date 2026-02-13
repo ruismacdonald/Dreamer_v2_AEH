@@ -815,12 +815,11 @@ def main():
 
         print("Start training state ae model.")
         
-        sdm_stats = state_ae_model.train(dreamer.data_buffer.get_data())
+        sdm_stats = state_ae_model.train_on_buffer(dreamer.data_buffer)
         logger.log_scalars(sdm_stats, step=dreamer.data_buffer.steps * args.action_repeat)
         logger.flush()
         print("normalize:", state_ae_model._normalize_representations,
-              "mean set:", state_ae_model._repr_mean is not None,
-              "std set:", state_ae_model._repr_std is not None)
+              "stats_ready:", state_ae_model._repr_stats_ready)
 
         ckpt_dir = os.path.join(logdir, "ckpts/")
         if not (os.path.exists(ckpt_dir)):
