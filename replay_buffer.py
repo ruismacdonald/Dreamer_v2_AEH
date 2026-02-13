@@ -5,14 +5,17 @@ from collections import deque
 
 class ReplayBuffer:
     """
-    SimHash-indexed local-forgetting of ae encoded states
-        - Still stores transitions in a single global circular buffer (time-ordered).
+    Two modes:
+        1. Standard circular replay buffer (ae_process=False)
+            - Stores transitions in a single global ring buffer.
             - sample() returns Dreamer-style temporal sequences of length `seq_len`.
-        - Additionally maintains per-hash FIFO queues of *global indices* to decide
-            which transitions are "kept" vs "discarded" (local forgetting).
+        2. SimHash-indexed local-forgetting (ae_process=True)
+            - Still stores transitions in the SAME global ring buffer (time-ordered).
+            - Additionally maintains per-hash FIFO queues of *global indices* to decide
+                which transitions are "kept" vs "discarded" (local forgetting).
 
-    SimHash key from the state ae representation passed to add():
-        dots = rep @ A_latent_t.T  # (hash_bits,)
+    SimHash key from the state-ae representation passed to add():
+        dots = rep @ A_latent.T  # (hash_bits,)
         bits = (dots >= 0).astype(np.uint8)  # (hash_bits,)
         packed = np.packbits(bits, bitorder=...)  # bytes key
         key = bytes(packed)
@@ -41,19 +44,19 @@ class ReplayBuffer:
         action_size,
         seq_len,
         batch_size,
-        ae_process: bool = True,
+        ae_process: bool = False,
         obs_hash_size: int = 32,
         obs_hash_count: int = 2000,
         seed: int = 0,
         packbit_order: str = "little",
     ):
-        self._rng = np.random.default_rng(seed)
-        self.ae_process = bool(ae_process)
         self.size = int(size)
         self.obs_shape = tuple(obs_shape)
         self.action_size = int(action_size)
         self.seq_len = int(seq_len)
         self.batch_size = int(batch_size)
+
+        self.ae_process = bool(ae_process)
 
         # Stats
         self.steps, self.episodes = 0, 0
@@ -73,23 +76,29 @@ class ReplayBuffer:
         self.insert_id = np.zeros(self.size, dtype=np.int64)  # generation stamp per slot
         self._global_insert_id = 0
 
+        # Use a dedicated RNG so we never call np.random.choice() on a Python list
+        # (np.random.choice(list) converts list -> array each call, which is slow).
+        self._rng = np.random.default_rng(seed)
+
         # SimHash-bucketed state
-        self.hash_bits = int(obs_hash_size)  # SimHash bits
-        self.fifo_capacity = int(obs_hash_count)  # FIFO capacity per hash
+        if self.ae_process:
+            self.hash_bits = int(obs_hash_size)  # SimHash bits
+            self.fifo_capacity = int(obs_hash_count)  # FIFO capacity per hash
 
-        if self.hash_bits <= 0:
-            raise ValueError(f"obs_hash_size must be > 0, got {self.hash_bits}")
-        if self.fifo_capacity <= 0:
-            raise ValueError(f"obs_hash_count must be > 0, got {self.fifo_capacity}")
+            if self.hash_bits <= 0:
+                raise ValueError(f"obs_hash_size must be > 0, got {self.hash_bits}")
+            if self.fifo_capacity <= 0:
+                raise ValueError(f"obs_hash_count must be > 0, got {self.fifo_capacity}")
 
-        if packbit_order not in ("little", "big"):
-            raise ValueError(f"packbit_order must be 'little' or 'big', got {packbit_order}")
-        self.packbit_order = packbit_order
+            if packbit_order not in ("little", "big"):
+                raise ValueError(f"packbit_order must be 'little' or 'big', got {packbit_order}")
+            self.packbit_order = packbit_order
 
-        self._seed = int(seed)
+            self._seed = int(seed)
 
-        # Representation dim is unknown until we see the first representation
-        self.obs_repr_size = None  # inferred later
+            # Representation dim is unknown until we see the first representation
+            self.obs_repr_size = None  # inferred later
+            self.A_latent = None  # (hash_bits, obs_repr_size) created lazily
 
     def _flat_add(self, idx: int) -> None:
         """Add idx to the flat kept-set if not present."""
@@ -109,46 +118,36 @@ class ReplayBuffer:
         self.loca_indices_flat.pop()
         self.flat_pos[idx] = -1
 
-    def _invalidate_slot_membership(self, i: int):
-        if self.flat_pos[i] != -1:
-            self._flat_remove(i)
-
     # SimHash helpers
-    def _ensure_simhash_matrix(self, rep_t: torch.Tensor) -> None:
-        """Initialize A_latent_t once we know the representation dim"""
-        # rep_t: (B, D) or (D,)
-        D = int(rep_t.shape[-1])
+    def _ensure_simhash_matrix(self, rep: np.ndarray) -> None:
+        """Initialize A_latent once we know the representation dim"""
+        rep = np.asarray(rep, dtype=np.float32).reshape(-1)
+
         if self.obs_repr_size is None:
-            self.obs_repr_size = D
-
+            self.obs_repr_size = int(rep.shape[0])
             rng = np.random.default_rng(self._seed)
-            A = rng.standard_normal(size=(self.hash_bits, D)).astype(np.float32)
-            A /= (np.linalg.norm(A, axis=1, keepdims=True) + 1e-8)
+            A = rng.standard_normal(size=(self.hash_bits, self.obs_repr_size)).astype(np.float32)
 
-            # store torch copy on the device where reps live
-            self.A_latent_t = torch.as_tensor(A, device=rep_t.device, dtype=torch.float32)
+            norms = np.linalg.norm(A, axis=1, keepdims=True)
+            norms[norms == 0] = 1.0  # divide-by-zero guard, if row of A is zero norm (all 0s) set to 1 (stays all 0s after division)
+            self.A_latent = A / norms
             
-    def _simhash_key_u32(self, rep_t: torch.Tensor, A_t: torch.Tensor) -> torch.Tensor:
+    def _simhash_key(self, rep: np.ndarray) -> bytes:
         """
-        u32 = unsigned 32-bit integer
-        We 32 hash bits (hash_bits = 32, those 32 bits can be packed into a single integer in 
-        the range 0 to 2^32 − 1.
-        key_u32 = the SimHash key stored as one 32-bit unsigned int (is tiny bc 1 number, is much faster)
+        rep: shape (obs_repr_size,)
 
-        rep_t: (B, D) float32 on GPU
-        A_t: (32, D) float32 on GPU, row-normalized
-        returns: (B,) torch.int64 keys (each fits in 32 bits), bytes (packed bits) to use as dict key.
+        Returns: bytes (packed bits) to use as dict key.
         """
-        dots = rep_t @ A_t.T  # (B, 32)
-        bits = (dots >= 0).to(torch.int64)  # (B, 32) in {0,1}
+        rep = np.asarray(rep, dtype=np.float32).reshape(-1)
+        self._ensure_simhash_matrix(rep)
 
-        # bit 0 = least significant bit (LSB) (matches "little" convention)
-        assert self.hash_bits == 32
-        weights = (1 << torch.arange(32, device=rep_t.device, dtype=torch.int64))  # (32,)
-        keys = (bits * weights).sum(dim=-1)  # (B,) int64, values < 2^32
-        return keys
+        # Now rep dim matches A_latent by construction
+        dots = rep @ self.A_latent.T  # (hash_bits,)
+        bits = (dots >= 0).astype(np.uint8)  # (hash_bits,)
+        packed = np.packbits(bits, bitorder=self.packbit_order)
+        return packed.tobytes()
 
-    def _get_fifo(self, key_u32: int) -> deque:
+    def _get_fifo(self, key: bytes) -> deque:
         """
         Return the per-hash FIFO for this key.
 
@@ -156,74 +155,62 @@ class ReplayBuffer:
         - idx is the global ring slot index
         - insert_id is the generation stamp for that slot at insertion time
         """
-        fifo = self.loca_indices.get(key_u32)
+        fifo = self.loca_indices.get(key)
         if fifo is None:
             fifo = deque()  # capacity enforced manually so we can handle stale entries cleanly
-            self.loca_indices[key_u32] = fifo
+            self.loca_indices[key] = fifo
         return fifo
 
-    def add(self, obs, action, reward, done, rep_t=None, key_u32=None):
+    def add(self, obs, action, reward, done, rep=None):
         """
         observation: dict with key "image"
         action: action vector
         reward: float
         done: bool/float
-        representation: torch.Tensor or np.ndarray
+        representation: torch.Tensor or np.ndarray, required if ae_process=True
         """
         i = self.idx
-        # Overwriting slot i due to circular replay: remove stale kept-start membership; we'll 
-        # re-add for the new transition (kept-start mirrors reward_mask).
-        self._invalidate_slot_membership(i)
 
         # Write to global ring (always)
         self.observations[i] = obs["image"]
         self.actions[i] = action
         self.rewards[i] = reward
         self.terminals[i] = done
-        self.reward_mask[i] = 1.0  # Temporally overwritten (circular) slots become valid again
+        self.reward_mask[i] = 1.0  # temporally overwritten (circular) slots become valid again
 
-        if not self.ae_process:
-            # Just advance ring
-            self.idx = (self.idx + 1) % self.size
-            self.full = self.full or self.idx == 0
-            self.steps += 1
-            self.episodes += (1 if done else 0)
-            return
+        if self.ae_process:
+            if rep is None:
+                raise ValueError("ae_process=True requires `representation` in add().")
 
-        if key_u32 is None:
-            if rep_t is None:
-                raise ValueError("Need rep_t or key_u32")
+            if isinstance(rep, torch.Tensor):
+                rep = rep.detach().cpu().numpy().astype(np.float32).reshape(-1)
+            else:
+                rep = np.asarray(rep, dtype=np.float32).reshape(-1)
 
-            # rep_t should be torch on GPU (D,) or (1,D)
-            if rep_t.ndim == 1:
-                rep_t = rep_t.unsqueeze(0)  # (1,D)
+            # Stamp this slot-version
+            self._global_insert_id += 1
+            self.insert_id[i] = self._global_insert_id
 
-            self._ensure_simhash_matrix(rep_t)
-            key_t = self._simhash_key_u32(rep_t, self.A_latent_t)  # (1,)
-            key_u32 = int(key_t[0].item())  # tiny CPU transfer (one int)
+            key = self._simhash_key(rep)
+            fifo = self._get_fifo(key)
 
-        # Stamp this slot-version
-        self._global_insert_id += 1
-        self.insert_id[i] = self._global_insert_id
+            # Ensure this new idx is eligible as a START index
+            self._flat_add(i)
 
-        fifo = self._get_fifo(key_u32)
+            # Add (idx, insert_id) so old references become stale on overwrite
+            fifo.append((i, self.insert_id[i]))
 
-        # Ensure this new idx is eligible as a start index
-        self._flat_add(i)
-
-        # Add (idx, insert_id) so old references become stale on overwrite
-        fifo.append((i, self.insert_id[i]))
-
-        # If bucket too large, discard oldest valid (still-current) entry
-        while len(fifo) > self.fifo_capacity:
-            disc_idx, disc_ins_idx = fifo.popleft()
-            # stale? (slot reused since it was bucketed) -> ignore
-            if self.insert_id[disc_idx] != disc_ins_idx:
-                continue
-            # valid eviction: mark discarded + remove from start pool
-            if self.reward_mask[disc_idx] != 0.0:
-                self.reward_mask[disc_idx] = 0.0
-                self._flat_remove(disc_idx)
+            # If bucket too large, discard oldest LIVE entry
+            while len(fifo) > self.fifo_capacity:
+                disc_idx, disc_ins_idx = fifo.popleft()
+                # stale? (slot reused since it was bucketed) -> ignore
+                if self.insert_id[disc_idx] != disc_ins_idx:
+                    continue
+                # live eviction: mark discarded + remove from start pool
+                if self.reward_mask[disc_idx] != 0.0:
+                    self.reward_mask[disc_idx] = 0.0
+                    self._flat_remove(disc_idx)
+                break
 
         # Advance ring pointer + stats
         self.idx = (self.idx + 1) % self.size
@@ -232,43 +219,28 @@ class ReplayBuffer:
         self.episodes += (1 if done else 0)
 
     # Sampling
+
+    def _sample_idx(self, L):
+        """Standard Dreamer sampling from the global ring."""
+        valid_idx = False
+        hi = (self.size if self.full else self.idx - L)
+        while not valid_idx:
+            idx = int(self._rng.integers(0, hi))
+            idxs = np.arange(idx, idx + L) % self.size
+            valid_idx = self.idx not in idxs[1:]
+        return idxs
     
-    def _sample_idx(self, L: int):
-        """Choose start index and return a temporal window of length L."""
-        if not self.ae_process:
-            # Sample start uniformly from the *valid* portion of the ring
-            if not self.full:
-                max_start = self.idx - L
-                if max_start < 0:
-                    raise RuntimeError("Not enough data to sample yet.")
-                start = int(self._rng.integers(0, max_start + 1))
-                return np.arange(start, start + L, dtype=np.int64)
-            else:
-                # Full ring: avoid windows that cross the current write index
-                while True:
-                    start = int(self._rng.integers(0, self.size))
-                    idxs = (np.arange(start, start + L) % self.size).astype(np.int64)
-                    if self.idx in idxs[1:]:
-                        continue
-                    return idxs
-        
+    def _sample_idx_ae(self, L: int):
+        """AE-process sampling: choose start from currently-kept indices, then return temporal window."""
         if len(self.loca_indices_flat) == 0:
             raise RuntimeError("No kept indices available yet (loca_indices_flat is empty).")
 
-        while True:
-            start = int(self._rng.choice(self.loca_indices_flat))
-
-            # if not full, require contiguous window entirely inside [0, self.idx)
-            if not self.full:
-                if start + L > self.idx:
-                    continue
-                idxs = np.arange(start, start + L, dtype=np.int64)
-            else:
-                idxs = (np.arange(start, start + L) % self.size).astype(np.int64)
-                if self.idx in idxs[1:]:
-                    continue
-
-            return idxs
+        valid_idx = False
+        while not valid_idx:
+            start = self.loca_indices_flat[int(self._rng.integers(0, len(self.loca_indices_flat)))]
+            idxs = (np.arange(start, start + L) % self.size).astype(np.int64)
+            valid_idx = self.idx not in idxs[1:]
+        return idxs
 
     def _retrieve_batch(self, idxs, n, L):
         vec_idxs = idxs.transpose().reshape(-1)  # Unroll indices
@@ -285,12 +257,24 @@ class ReplayBuffer:
         n = self.batch_size
         L = self.seq_len
 
-        idxs = np.asarray([self._sample_idx(L) for _ in range(n)])
+        if not self.ae_process:
+            idxs = np.asarray([self._sample_idx(L) for _ in range(n)])
+        else:
+            idxs = np.asarray([self._sample_idx_ae(L) for _ in range(n)])
 
         obs, acs, rews, terms, reward_mask = self._retrieve_batch(idxs, n, L)
         return obs, acs, rews, terms, reward_mask
 
     def report_statistics(self):
+        if not self.ae_process:
+            return {
+                "rewards_statistics": [
+                    (float(r), int(cnt))
+                    for r, cnt in zip(*np.unique(self.rewards, return_counts=True))
+                ]
+            }
+
+        # ae_process=True
         fifo_sizes = [len(dq) for dq in self.loca_indices.values()]
         total = int(np.sum(fifo_sizes)) if fifo_sizes else 0
         return {
@@ -302,14 +286,15 @@ class ReplayBuffer:
                 "max": int(np.max(fifo_sizes)) if fifo_sizes else 0,
                 "mean": float(np.mean(fifo_sizes)) if fifo_sizes else 0.0,
             },
-            "reward_mask_sum_global": float(self.reward_mask.sum()),
-            "reward_mask_mean_global": float(self.reward_mask.mean()),
         }
 
     def get_data(self):
-        observations = self.observations[: self.idx].copy()  # uint8 (N,C,H,W)
-        return {
-            "observation": observations,
-            "terminal": self.terminals[: self.idx].copy(),
-            "loca_indices_flat": self.loca_indices_flat.copy(),
+        N = self.size if self.full else self.idx
+        data = {
+            # keep as uint8, no torch, no float32, no normalization here
+            "observation": self.observations[:N],   # uint8
+            "terminal": self.terminals[:N].copy(),
         }
+        if self.ae_process:
+            data.update({"loca_indices_flat": self.loca_indices_flat.copy()})
+        return data

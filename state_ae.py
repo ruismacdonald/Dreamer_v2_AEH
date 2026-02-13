@@ -292,6 +292,9 @@ class StateAutoEncoderModel(nn.Module):
 
         return DataLoader(AEImageDataset(images), **dataloader_kwargs)
 
+    def _reduce_stats(self, running: dict, stats: dict, bs: int):
+        for k, v in stats.items():
+            running[k] = running.get(k, 0.0) + float(v) * bs
 
     # Loss
     def calculate_loss(
@@ -348,16 +351,30 @@ class StateAutoEncoderModel(nn.Module):
 
         total = recon_loss + float(lambda_binarize) * binarize_loss + anti_collapse
 
-        return (
-            total,
-            recon_loss.detach(),
-            binarize_loss.detach(),
-            anti_collapse.detach(),
-            balance_loss.detach(),
-            decorrel_loss.detach(),
-            entropy_push.detach(),
-        )
+        stats = {
+            "ae_total": total.detach().cpu().item(),
+            "ae_recon": recon_loss.detach().cpu().item(),
+            "ae_binar": binarize_loss.detach().cpu().item(),
+            "ae_anti": anti_collapse.detach().cpu().item(),
+            "ae_bal": balance_loss.detach().cpu().item(),
+            "ae_dec": decorrel_loss.detach().cpu().item(),
+            "ae_ent": entropy_push.detach().cpu().item(),
+            "ae_bit_mean_mean": bit_mean.mean().detach().cpu().item(),
+            "ae_bit_mean_min": bit_mean.min().detach().cpu().item(),
+            "ae_bit_mean_max": bit_mean.max().detach().cpu().item(),
+        }
 
+        return total, stats, recon.detach(), b.detach(), z.detach()
+    
+    def _tstats(self, t: torch.Tensor, prefix: str) -> dict:
+        t = t.detach()
+        return {
+            f"{prefix}_min": float(t.min().cpu().item()),
+            f"{prefix}_max": float(t.max().cpu().item()),
+            f"{prefix}_mean": float(t.mean().cpu().item()),
+            f"{prefix}_std": float(t.std(unbiased=False).cpu().item()),
+            f"{prefix}_abs_mean": float(t.abs().mean().cpu().item()),
+        }
 
     # Training
     def train(self, buffer=None, num_epochs: Optional[int] = None, lambda_binarize: float = 1e-3, noise_a: float = 0.3):
@@ -373,19 +390,18 @@ class StateAutoEncoderModel(nn.Module):
         self._decoder_seed.train()
         self._decoder_deconv.train()
 
-        for _ in range(int(num_epochs)):
-            running_total = running_recon = running_binar = 0.0
-            running_anti = 0.0
+        for epoch in range(int(num_epochs)):
+            running = {}
             n_samples = 0
+            did_range_log = False
 
             for batch in loader:
-                # Batch: (B,C,H,W) float in [0,1]
                 x = batch[0] if isinstance(batch, (tuple, list)) else batch
-                x = x.to(self._device, non_blocking=(self._device.type == "cuda")).float()
+                x = x.to(self._device, non_blocking=(self._device.type=="cuda")).float()
 
                 self._optimizer.zero_grad(set_to_none=True)
 
-                total, recon, binar, anti, bal, dec, ent = self.calculate_loss(
+                total, stats, recon_det, b_det, z_det = self.calculate_loss(
                     x, lambda_binarize=lambda_binarize, noise_a=noise_a
                 )
 
@@ -395,17 +411,24 @@ class StateAutoEncoderModel(nn.Module):
                 self._optimizer.step()
 
                 bs = int(x.shape[0])
-                running_total += float(total.item()) * bs
-                running_recon += float(recon.item()) * bs
-                running_binar += float(binar.item()) * bs
-                running_anti += float(anti.item()) * bs
+                self._reduce_stats(running, stats, bs)
                 n_samples += bs
 
+                # log ranges once per epoch (first batch)
+                if not did_range_log:
+                    range_stats = {}
+                    range_stats.update(self._tstats(x, "ae_in_x01"))  # should be approx [0,1]
+                    range_stats.update(self._tstats(z_det, "ae_enc_z"))  # encoder output (pre-sigmoid)
+                    range_stats.update(self._tstats(torch.sigmoid(z_det), "ae_enc_b"))  # in [0,1]
+                    range_stats.update(self._tstats(recon_det, "ae_dec_recon"))  # should be approx [0,1]
+                    self._reduce_stats(running, range_stats, bs)  # or just add unweighted
+                    did_range_log = True
+
             den = max(n_samples, 1)
-            self._logger.log_scalar("ae/total_loss", running_total / den, "agent")
-            self._logger.log_scalar("ae/recon_loss", running_recon / den, "agent")
-            self._logger.log_scalar("ae/binarize_loss", running_binar / den, "agent")
-            self._logger.log_scalar("ae/anti_collapse", running_anti / den, "agent")
+            epoch_stats = {k: v / den for k, v in running.items()}
+
+            for k, v in epoch_stats.items():
+                self._logger.log_scalar(f"ae/{k}", v, "agent")
 
         self._encoder_net.eval()
         self._decoder_seed.eval()
@@ -413,7 +436,9 @@ class StateAutoEncoderModel(nn.Module):
         self.enable_fast_inference(use_half=False, compile_encoder=self._compile_encoder)
 
         if self._normalize_representations:
-            self.learn_representation_stats_from_buffer(buffer)
+            stats = self.learn_representation_stats_from_buffer(buffer)
+            for k, v in stats.items():
+                self._logger.log_scalar(f"ae_stats/{k}", v, "agent")
 
 
     # Fast inference/deploy
@@ -431,110 +456,108 @@ class StateAutoEncoderModel(nn.Module):
                 pass
 
 
-    def has_rep_stats(self) -> bool:
-        return (self._repr_mean_t is not None) and (self._repr_std_t is not None)
-
-
     @torch.no_grad()
-    def get_representation_torch(self, obs: torch.Tensor) -> torch.Tensor:
+    def learn_representation_stats(self, data: Dict[str, Any], batch_size: int = 256):
+        """
+        - computes encoder output stats over data["observation"]
+        - (optionally) sets self._repr_mean_t / self._repr_std_t for normalization
+        Expects:
+        data["observation"] is uint8 (N,C,H,W) (like your ReplayBuffer.get_data()).
+        """
+        obs = data.get("observation", None)
+        if obs is None:
+            raise ValueError("learn_representation_stats: data missing 'observation'")
+
+        # to torch CPU
+        obs_t = torch.as_tensor(obs)  # uint8 or float, CPU
+
         self._encoder_net.eval()
-        x01 = self._to_01_bchw(obs).to(self._device, non_blocking=(self._device.type=="cuda"))
-        z = self._encoder_net(x01)
+
+        zs = []
+        N = int(obs_t.shape[0])
+        for s in range(0, N, int(batch_size)):
+            batch = obs_t[s : s + int(batch_size)]
+            x01 = self._to_01_bchw(batch).to(
+                self._device, non_blocking=(self._device.type == "cuda")
+            )
+            z = self._encoder_net(x01).detach()  # (B,D)
+            zs.append(z.float().cpu())
+
+        Z = torch.cat(zs, dim=0)  # (N,D) on CPU
+        z_np = Z.numpy()
+
+        # out stats (like SDM)
+        norms = np.linalg.norm(z_np, axis=1)
+        stats = {
+            "ae_out_min": float(z_np.min()),
+            "ae_out_max": float(z_np.max()),
+            "ae_out_mean": float(z_np.mean()),
+            "ae_out_std": float(z_np.std()),
+            "ae_out_abs_mean": float(np.mean(np.abs(z_np))),
+            "ae_out_p01": float(np.quantile(z_np, 0.01)),
+            "ae_out_p50": float(np.quantile(z_np, 0.50)),
+            "ae_out_p99": float(np.quantile(z_np, 0.99)),
+            "ae_out_norm_mean": float(norms.mean()),
+            "ae_out_norm_p99": float(np.quantile(norms, 0.99)),
+        }
 
         if self._normalize_representations:
-            assert self.has_rep_stats(), "rep stats not set"
+            mean = Z.mean(dim=0)
+            std = Z.std(dim=0, unbiased=False).clamp_min(1e-8)
+
+            self._repr_mean_t = mean.to(self._device)
+            self._repr_std_t = std.to(self._device)
+
+            z_normed = ((Z - mean) / std).numpy()
+            stats.update(
+                {
+                    "ae_out_normed_min": float(z_normed.min()),
+                    "ae_out_normed_max": float(z_normed.max()),
+                    "ae_out_normed_mean": float(z_normed.mean()),
+                    "ae_out_normed_std": float(z_normed.std()),
+                    "ae_out_normed_p01": float(np.quantile(z_normed, 0.01)),
+                    "ae_out_normed_p99": float(np.quantile(z_normed, 0.99)),
+                    "ae_repr_mean_set": 1.0,
+                    "ae_repr_std_set": 1.0,
+                    "ae_repr_mean_abs_mean": float(mean.abs().mean().item()),
+                    "ae_repr_std_mean": float(std.mean().item()),
+                    "ae_repr_std_min": float(std.min().item()),
+                }
+            )
+        else:
+            stats.update(
+                {
+                    "ae_repr_mean_set": float(self._repr_mean_t is not None),
+                    "ae_repr_std_set": float(self._repr_std_t is not None),
+                }
+            )
+
+        return stats
+
+    @torch.no_grad()
+    def get_representation(self, obs: torch.Tensor) -> np.ndarray:
+        """
+          - obs can be CHW/HWC/BCHW/BHWC, uint8 or float
+          - returns (latent_dim,) numpy float32
+
+        Important:
+          - if normalize_representations=True, requires _repr_mean_t/_repr_std_t already set.
+        """
+        self._encoder_net.eval()
+
+        x01 = self._to_01_bchw(obs).to(
+            self._device, non_blocking=(self._device.type == "cuda")
+        )
+        z = self._encoder_net(x01)  # (B,D)
+
+        if self._normalize_representations:
+            if self._repr_mean_t is None or self._repr_std_t is None:
+                raise RuntimeError("normalize_representations=True but rep stats are not set")
             z = (z - self._repr_mean_t) / self._repr_std_t
             z = z / (z.norm(dim=-1, keepdim=True) + 1e-8)
 
-        return z
-
-
-    # Rep stats (streaming Welford)
-
-    @torch.no_grad()
-    def reset_representation_stats_accum(self) -> None:
-        self._repr_stat_count = 0
-        self._repr_stat_mean_t = None
-        self._repr_stat_M2_t = None
-
-    @torch.no_grad()
-    def update_representation_stats_accum(self, obs: torch.Tensor) -> None:
-        if not self._normalize_representations:
-            return
-        x01 = self._to_01_bchw(obs).to(self._device, non_blocking=(self._device.type=="cuda"))
-        z = self._encoder_net(x01).detach()
-
-        b = int(z.shape[0])
-        if b == 0:
-            return
-
-        batch_mean = z.mean(dim=0)
-        batch_var = z.var(dim=0, unbiased=False)
-
-        if self._repr_stat_mean_t is None:
-            self._repr_stat_mean_t = batch_mean
-            self._repr_stat_M2_t = batch_var * b
-            self._repr_stat_count = b
-        else:
-            count = int(self._repr_stat_count)
-            new_count = count + b
-            delta = batch_mean - self._repr_stat_mean_t
-            self._repr_stat_mean_t = self._repr_stat_mean_t + delta * (b / new_count)
-            self._repr_stat_M2_t = (
-                self._repr_stat_M2_t
-                + batch_var * b
-                + (delta * delta) * (count * b / new_count)
-            )
-            self._repr_stat_count = new_count
-
-    @torch.no_grad()
-    def finalize_representation_stats_accum(self, clamp_std: float = 1e-3) -> None:
-        if not self._normalize_representations:
-            return
-        if self._repr_stat_mean_t is None or int(self._repr_stat_count) <= 0:
-            return
-
-        var = self._repr_stat_M2_t / max(int(self._repr_stat_count), 1)
-        std = torch.sqrt(var).clamp_min(float(clamp_std))
-        mean = self._repr_stat_mean_t
-
-        self._repr_mean_t = mean.to(self._device)
-        self._repr_std_t = std.to(self._device)
-
-    @torch.no_grad()
-    def learn_representation_stats_from_buffer(self, buffer: Any, batch_size: int = 256) -> None:
-        """
-        Compute mean/std over encoder logits z from either:
-        - a replay buffer (with get_data), or
-        - a dict containing {"observation": ...}
-        """
-        if not self._normalize_representations:
-            return
-
-        # Accept dict directly (your phase2_data path)
-        if isinstance(buffer, dict):
-            data = buffer
-        else:
-            data = self._get_buffer_data(buffer)
-
-        obs = data.get("observation", None)
-        if obs is None:
-            raise ValueError("Missing 'observation'")
-
-        if torch.is_tensor(obs):
-            obs = obs.detach().cpu().numpy()
-
-        N = int(obs.shape[0])
-        self.reset_representation_stats_accum()
-
-        for s in range(0, N, int(batch_size)):
-            batch_np = obs[s:s + int(batch_size)]
-            batch = torch.as_tensor(batch_np, device=self._device)
-            x01 = self._to_01_bchw(batch)  # Handles uint8/float/shapes
-            self.update_representation_stats_accum(x01)
-            
-        self.finalize_representation_stats_accum()
-
+        z0 = z[0].detach().cpu().numpy().astype(np.float32, copy=False)
+        return z0
 
     # Save/load
 
