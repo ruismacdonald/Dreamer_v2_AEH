@@ -797,11 +797,12 @@ def main():
     logger = Logger(logdir)
 
     if args.loca_state_ae:
+        ae_device = "cuda" if (torch.cuda.is_available() and not args.no_gpu) else "cpu"
         state_ae_model = StateAutoEncoderModel(
             obs_shape, 
             torch.optim.Adam, 
             latent_dim=args.loca_latent_size,
-            device=device,
+            device=ae_device,
             normalize_representations=args.normalize_representations, 
             seed=args.seed,
         )
