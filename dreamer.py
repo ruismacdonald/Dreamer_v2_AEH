@@ -38,15 +38,19 @@ def preprocess_obs(obs):
     return obs
 
 def to_bchw(img) -> torch.Tensor:
-    # img is usually np.uint8 CHW (from env wrapper)
     if isinstance(img, np.ndarray):
-        t = torch.from_numpy(img)  # zero-copy CPU
+        t = torch.from_numpy(img)
     else:
         t = img
 
-    if t.ndim == 3:
-        t = t.unsqueeze(0)  # (1,C,H,W)
+    if t.ndim == 3 and t.shape[-1] in (1, 3) and t.shape[0] not in (1, 3):
+        # HWC -> CHW
+        t = t.permute(2, 0, 1)
 
+    if t.ndim == 3:
+        t = t.unsqueeze(0)
+
+    assert t.ndim == 4 and t.shape[1] in (1,3), f"Expected BCHW with C in (1,3), got {tuple(t.shape)}"
     return t
 
 
@@ -376,6 +380,9 @@ class Dreamer:
         rews = torch.from_numpy(rews).to(self.device, non_blocking=True).unsqueeze(-1)
         nonterms = torch.from_numpy(1.0 - terms).to(self.device, non_blocking=True).unsqueeze(-1)
         reward_mask = torch.from_numpy(reward_mask).to(self.device, non_blocking=True).unsqueeze(-1)
+
+        assert reward_mask.shape[0] == self.args.train_seq_len
+        assert reward_mask.shape[1] == self.args.batch_size
 
         model_loss, model_loss_terms, rew_loss_stats = self.world_model_loss(obs, acs, rews, nonterms, reward_mask)
         self.world_model_opt.zero_grad()

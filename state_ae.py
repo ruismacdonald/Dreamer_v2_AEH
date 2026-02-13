@@ -423,32 +423,35 @@ class StateAutoEncoderModel(nn.Module):
         return out
 
     @torch.no_grad()
-    def get_representation(self, obs: Union[np.ndarray, torch.Tensor]) -> np.ndarray:
+    def get_representation(self, obs) -> np.ndarray:
         """
-        Returns a single (D,) numpy float32 representation for hashing.
-
-        Build a batch of size 1 (unsqueeze(0)) so rep[0] is the representation for that one observation.
+        Accepts: CHW uint8, HWC uint8, BCHW, or BHWC.
+        Returns: (D,) float32 rep.
         """
         self.eval()
 
-        # Accept CHW/HWC/BCHW/BHWC but in your pipeline you pass CHW uint8 usually.
-        x = torch.as_tensor(obs)
+        x = obs
+        if isinstance(x, np.ndarray):
+            x = torch.from_numpy(x)
+        elif not torch.is_tensor(x):
+            x = torch.as_tensor(x)
+
         if x.ndim == 3:
-            # CHW or HWC -> BCHW
-            if x.shape[-1] in (1, 3):  # HWC
+            # If it's HWC, convert to CHW
+            if x.shape[0] not in (1, 3) and x.shape[-1] in (1, 3):
                 x = x.permute(2, 0, 1)
-            x = x.unsqueeze(0)
+            x = x.unsqueeze(0)  # -> BCHW
+
         elif x.ndim == 4:
-            if x.shape[-1] in (1, 3):  # BHWC
+            # If it's BHWC, convert to BCHW
+            if x.shape[1] not in (1, 3) and x.shape[-1] in (1, 3):
                 x = x.permute(0, 3, 1, 2)
         else:
             raise ValueError(f"Expected 3D/4D image, got {tuple(x.shape)}")
 
-        x01 = _as_bchw_float01(x).to(
-            self._device, non_blocking=(self._device.type == "cuda")
-        )
+        x01 = _as_bchw_float01(x).to(self._device, non_blocking=(self._device.type == "cuda"))
 
-        z_logits, b_soft = self.encode(x01)
+        z_logits, _ = self.encode(x01)
         rep = z_logits  # (1,D)
 
         if self._normalize_representations:
@@ -456,8 +459,7 @@ class StateAutoEncoderModel(nn.Module):
                 raise RuntimeError("normalize_representations=True but stats not learned yet")
             rep = (rep - self._repr_mean_t) / self._repr_std_t
 
-        rep0 = rep[0].detach().cpu().numpy().astype(np.float32, copy=False)  # Grabs first item form batch, so (B,D) -> (D,) (B is batch size, D is latent dim)
-        return rep0
+        return rep[0].detach().cpu().numpy().astype(np.float32, copy=False)
 
 
     # Fast inference / compile
