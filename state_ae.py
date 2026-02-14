@@ -365,12 +365,11 @@ class StateAutoEncoderModel(nn.Module):
         self.eval()
         self.enable_fast_inference(use_half=False, compile_encoder=self._compile_encoder)
 
-        # Compute stats for normalization
-        if self._normalize_representations:
-            data = self._get_buffer_data(buffer)
-            stats = self.learn_representation_stats(data)
-            for k, v in stats.items():
-                self._logger.log_scalar(f"ae_stats/{k}", v, "agent")
+        # Compute and log rep stats
+        data = self._get_buffer_data(buffer)
+        stats = self.learn_representation_stats(data)
+        for k, v in stats.items():
+            self._logger.log_scalar(f"ae_stats/{k}", v, "agent")
 
         return last_epoch_stats
 
@@ -401,10 +400,10 @@ class StateAutoEncoderModel(nn.Module):
         mean = R.mean(dim=0)
         std = R.std(dim=0, unbiased=False).clamp_min(1e-8)
 
-        # store as buffers on device
-        self._repr_mean_t.copy_(mean.to(self._repr_mean_t.device))
-        self._repr_std_t.copy_(std.to(self._repr_std_t.device))
-        self._repr_stats_ready = True
+        if self._normalize_representations:
+            self._repr_mean_t.copy_(mean.to(self._repr_mean_t.device))
+            self._repr_std_t.copy_(std.to(self._repr_std_t.device))
+            self._repr_stats_ready = True
 
         r_np = R.numpy()
         norms = np.linalg.norm(r_np, axis=1)

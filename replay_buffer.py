@@ -232,15 +232,6 @@ class ReplayBuffer:
         valid_idx = False
         while not valid_idx:
             start = int(np.random.choice(self.loca_indices_flat))
-
-            # If buffer isn't full yet, you can't wrap around.
-            # So require the whole window [start, start+L) to be inside [0, self.idx).
-            if not self.full:
-                if self.idx < L:
-                    raise RuntimeError(f"Not enough data to sample: idx={self.idx} < L={L}")
-                if start > (self.idx - L):
-                    continue
-
             idxs = (np.arange(start, start + L) % self.size).astype(np.int64)
             valid_idx = self.idx not in idxs[1:]
         return idxs
@@ -295,11 +286,10 @@ class ReplayBuffer:
         }
 
     def get_data(self):
-        N = self.size if self.full else self.idx
         data = {
-            # keep as uint8, no torch, no float32, no normalization here
-            "observation": self.observations[:N].copy(),   # uint8
-            "terminal": self.terminals[:N].copy(),
+            # Keep as uint8, no torch, no float32, no normalization here
+            "observation": self.observations[: self.idx].copy(),  # uint8
+            "terminal": self.terminals[: self.idx].copy(),
         }
         if self.ae_process:
             data.update({"loca_indices_flat": self.loca_indices_flat.copy()})
