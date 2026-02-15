@@ -76,6 +76,10 @@ class ReplayBuffer:
         self.insert_id = np.zeros(self.size, dtype=np.int64)  # generation stamp per slot
         self._global_insert_id = 0
 
+        # # Use a dedicated RNG so we never call np.random.choice() on a Python list
+        # # (np.random.choice(list) converts list -> array each call, which is slow).
+        # self._rng = np.random.default_rng(seed)
+
         # SimHash-bucketed state
         if self.ae_process:
             self.hash_bits = int(obs_hash_size)  # SimHash bits
@@ -215,7 +219,7 @@ class ReplayBuffer:
         self.episodes += (1 if done else 0)
 
     # Sampling
-
+    
     def _sample_idx(self, L):
         """Standard Dreamer sampling from the global ring."""
         valid_idx = False
@@ -248,9 +252,6 @@ class ReplayBuffer:
         )
 
     def sample(self):
-        if self.ae_process and not self.full and self.idx < self.seq_len:
-            raise RuntimeError(f"Sampling too early: idx={self.idx}, seq_len={self.seq_len}")
-        
         n = self.batch_size
         L = self.seq_len
 
@@ -286,8 +287,13 @@ class ReplayBuffer:
         }
 
     def get_data(self):
+        observations = torch.as_tensor(self.observations[: self.idx].copy().astype(np.float32))
+        # uint8 [0,255] -> float32 [-0.5, 0.5]
+        observations = observations.to(torch.float32) / 255.0 - 0.5
+        observations = observations.detach().cpu().numpy()
+
         data = {
-            "observation": self.observations[: self.idx].copy(),  # uint8 CHW
+            "observation": observations,
             "terminal": self.terminals[: self.idx].copy(),
         }
         if self.ae_process:

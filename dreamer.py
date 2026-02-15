@@ -38,6 +38,11 @@ def preprocess_obs(obs):
     return obs
 
 def to_bchw(img) -> torch.Tensor:
+    """
+    Accepts np array or torch tensor.
+    Returns float32 torch tensor with shape (1, C, H, W).
+    Handles HWC -> CHW if needed.
+    """
     if not isinstance(img, torch.Tensor):
         img = torch.tensor(img)
 
@@ -50,7 +55,7 @@ def to_bchw(img) -> torch.Tensor:
         img = img.unsqueeze(0)
 
     # Now should be BCHW
-    return img
+    return img.to(torch.float32)
 
 
 class Dreamer:
@@ -74,9 +79,6 @@ class Dreamer:
 
         self.loca_state_ae = loca_state_ae
         self.state_ae_model = None
-        if self.loca_state_ae and state_ae_model is None:
-            raise ValueError("loca_state_ae=True requires state_ae_model")
-        
         if self.loca_state_ae:
             self.data_buffer = ReplayBuffer(
                 self.args.buffer_size,
@@ -373,15 +375,17 @@ class Dreamer:
     def train_one_batch(self):
 
         obs, acs, rews, terms, reward_mask = self.data_buffer.sample()
-
-        obs = torch.from_numpy(obs).to(self.device, non_blocking=True)  # uint8 on GPU
-        acs = torch.from_numpy(acs).to(self.device, non_blocking=True)  # float32 already
-        rews = torch.from_numpy(rews).to(self.device, non_blocking=True).unsqueeze(-1)
-        nonterms = torch.from_numpy(1.0 - terms).to(self.device, non_blocking=True).unsqueeze(-1)
-        reward_mask = torch.from_numpy(reward_mask).to(self.device, non_blocking=True).unsqueeze(-1)
-
-        assert reward_mask.shape[0] == self.args.train_seq_len
-        assert reward_mask.shape[1] == self.args.batch_size
+        obs = torch.tensor(obs, dtype=torch.float32).to(self.device)
+        acs = torch.tensor(acs, dtype=torch.float32).to(self.device)
+        rews = torch.tensor(rews, dtype=torch.float32).to(self.device).unsqueeze(-1)
+        nonterms = (
+            torch.tensor((1.0 - terms), dtype=torch.float32)
+            .to(self.device)
+            .unsqueeze(-1)
+        )
+        reward_mask = (
+            torch.tensor(reward_mask, dtype=torch.float32).to(self.device).unsqueeze(-1)
+        )
 
         model_loss, model_loss_terms, rew_loss_stats = self.world_model_loss(obs, acs, rews, nonterms, reward_mask)
         self.world_model_opt.zero_grad()
@@ -414,7 +418,7 @@ class Dreamer:
 
     def act_with_world_model(self, obs, prev_state, prev_action, explore=False):
 
-        img = to_bchw(obs["image"]).to(self.device, non_blocking=True)
+        img = to_bchw(obs["image"]).to(self.device)
         obs_embed = self.obs_encoder(preprocess_obs(img))
         _, posterior = self.rssm.observe_step(prev_state, prev_action, obs_embed)
         features = torch.cat([posterior["stoch"], posterior["deter"]], dim=-1)
@@ -755,8 +759,16 @@ def main():
     parser.add_argument("--loca-hash-count", type=int, default=2000, help="")
 
     parser.add_argument("--normalize-representations", action="store_true", help="")
+    parser.add_argument("--resume-steps", type=int, default=0, help="Resume global_step (environment steps, after action_repeat)")
+    parser.add_argument("--ae-model-path", type=str, default="", help="Dictory containing ae_model.pt to load")
+    parser.add_argument("--skip-aem-train", action="store_true", help="If set do not collect/train state ae model")
 
     args = parser.parse_args()
+
+    # data_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "data/")
+
+    # if not (os.path.exists(data_path)):
+    #     os.makedirs(data_path)
 
     data_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "data")
     os.makedirs(data_path, exist_ok=True)
@@ -790,9 +802,6 @@ def main():
     else:
         device = torch.device("cpu")
 
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
     train_env = make_env(args, loca_phase, "train")
     test_env = make_env(args, loca_phase, "eval")
     obs_shape = train_env.observation_space["image"].shape
@@ -802,35 +811,30 @@ def main():
     logger = Logger(logdir)
 
     if args.loca_state_ae:
-        ae_device = "cuda" if (torch.cuda.is_available() and not args.no_gpu) else "cpu"
         state_ae_model = StateAutoEncoderModel(
-            obs_shape, 
-            torch.optim.Adam, 
-            latent_dim=args.loca_latent_size,
-            device=ae_device,
-            normalize_representations=args.normalize_representations, 
-            seed=args.seed,
+            obs_shape, torch.optim.Adam, latent_dim=args.loca_latent_size, device=device, normalize_representations=args.normalize_representations
         )
 
-        print("Start state ae learning process.")
+        print("Start state AE learning process.")
         num_state_ae_steps = 100000
         _ = dreamer.collect_random_episodes(
             train_env, num_state_ae_steps // args.action_repeat
         )
 
-        print("Start training state ae model.")
+        print("Start training state AE model.")
         
         sdm_stats = state_ae_model.train_on_buffer(dreamer.data_buffer)
         logger.log_scalars(sdm_stats, step=dreamer.data_buffer.steps * args.action_repeat)
         logger.flush()
         print("normalize:", state_ae_model._normalize_representations,
-              "stats_ready:", state_ae_model._repr_stats_ready)
+                "mean set:", state_ae_model._repr_mean is not None,
+                "std set:", state_ae_model._repr_std is not None)
 
         ckpt_dir = os.path.join(logdir, "ckpts/")
         if not (os.path.exists(ckpt_dir)):
             os.makedirs(ckpt_dir)
         state_ae_model.save(ckpt_dir)
-        print("Finished state ae learning process.")
+        print("Finish state AE learning process.")
 
         dreamer = Dreamer(
             args,
