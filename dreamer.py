@@ -826,9 +826,12 @@ def main():
         sdm_stats = state_ae_model.train_on_buffer(dreamer.data_buffer)
         logger.log_scalars(sdm_stats, step=dreamer.data_buffer.steps * args.action_repeat)
         logger.flush()
-        print("normalize:", state_ae_model._normalize_representations,
-                "mean set:", state_ae_model._repr_mean is not None,
-                "std set:", state_ae_model._repr_std is not None)
+        print(
+            "normalize:", state_ae_model._normalize_representations,
+            "stats ready:", state_ae_model._repr_stats_ready,
+            "mean shape:", tuple(state_ae_model._repr_mean_t.shape),
+            "std shape:", tuple(state_ae_model._repr_std_t.shape),
+        )
 
         ckpt_dir = os.path.join(logdir, "ckpts/")
         if not (os.path.exists(ckpt_dir)):
