@@ -38,20 +38,19 @@ def preprocess_obs(obs):
     return obs
 
 def to_bchw(img) -> torch.Tensor:
-    if isinstance(img, np.ndarray):
-        t = torch.from_numpy(img)
-    else:
-        t = img
+    if not isinstance(img, torch.Tensor):
+        img = torch.tensor(img)
 
-    if t.ndim == 3 and t.shape[-1] in (1, 3) and t.shape[0] not in (1, 3):
-        # HWC -> CHW
-        t = t.permute(2, 0, 1)
+    # If HWC (common from envs), convert to CHW
+    if img.ndim == 3 and img.shape[-1] in (1, 3):
+        img = img.permute(2, 0, 1)
 
-    if t.ndim == 3:
-        t = t.unsqueeze(0)
+    # If CHW, add batch dim
+    if img.ndim == 3:
+        img = img.unsqueeze(0)
 
-    assert t.ndim == 4 and t.shape[1] in (1,3), f"Expected BCHW with C in (1,3), got {tuple(t.shape)}"
-    return t
+    # Now should be BCHW
+    return img
 
 
 class Dreamer:
@@ -416,8 +415,7 @@ class Dreamer:
     def act_with_world_model(self, obs, prev_state, prev_action, explore=False):
 
         img = to_bchw(obs["image"]).to(self.device, non_blocking=True)
-        img = img.to(torch.float32).div_(255.0).sub_(0.5)
-        obs_embed = self.obs_encoder(img)
+        obs_embed = self.obs_encoder(preprocess_obs(img))
         _, posterior = self.rssm.observe_step(prev_state, prev_action, obs_embed)
         features = torch.cat([posterior["stoch"], posterior["deter"]], dim=-1)
         action = self.actor(features, deter=not explore)
@@ -445,8 +443,8 @@ class Dreamer:
             next_obs, rew, done, _ = env.step(action)
             rep = None
             if self.loca_state_ae:
-                img = to_bchw(obs["image"]).to(self.device, non_blocking=True)  # uint8 BCHW
-                rep = self.state_ae_model.get_representation(img)  # let AE normalize internally
+                img = to_bchw(obs["image"]).to(self.device)
+                rep = self.state_ae_model.get_representation(preprocess_obs(img))
 
             self.data_buffer.add(obs, action, rew, done, rep)
 
@@ -515,8 +513,8 @@ class Dreamer:
 
             rep = None
             if self.loca_state_ae:
-                img = to_bchw(obs["image"]).to(self.device, non_blocking=True)  # uint8 BCHW
-                rep = self.state_ae_model.get_representation(img)  # AE normalizes internally
+                img = to_bchw(obs["image"]).to(self.device)
+                rep = self.state_ae_model.get_representation(preprocess_obs(img))
                 
             self.data_buffer.add(obs, action, rew, done, rep)
             seed_episode_rews[-1] += rew

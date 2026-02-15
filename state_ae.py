@@ -1,7 +1,7 @@
 import os
 import random
 import multiprocessing as mp
-from typing import Tuple, Union, Optional, Any, Dict, Literal
+from typing import Tuple, Union, Optional, Any, Dict
 
 import numpy as np
 import torch
@@ -21,56 +21,58 @@ def workers_from_slurm(default_cap: int = 4) -> int:
     return max(0, min(default_cap, n))
 
 
-def _as_bchw_float01(images: Union[np.ndarray, torch.Tensor]) -> torch.Tensor:
+def _as_bchw_float(images: Union[np.ndarray, torch.Tensor]) -> torch.Tensor:
     """
-    Convert to BCHW float01
-    Return BCHW float32 in [0,1].
+    Convert to BCHW float32 in [-0.5, 0.5].
+
     Accepts:
-      - (N,C,H,W) uint8 in [0,255]
-      - (N,C,H,W) float in [0,1] or [-0.5,0.5] or [0,255]
+      - uint8 in [0,255]
+      - float in [0,1]
+      - float in [-0.5,0.5]
+      - float in [0,255]
     """
     x = torch.from_numpy(images) if isinstance(images, np.ndarray) else images
     if x.ndim != 4:
         raise ValueError(f"Expected (N,C,H,W), got {tuple(x.shape)}")
 
     if x.dtype == torch.uint8:
-        x = x.float().div_(255.0)
-        return x.clamp_(0.0, 1.0)
+        x = x.float().div_(255.0).sub_(0.5)
+        return x.clamp_(-0.5, 0.5)
 
     x = x.float()
     x_min = float(x.min().item()) if x.numel() else 0.0
     x_max = float(x.max().item()) if x.numel() else 0.0
 
-    if x_max > 1.5:       # looks like [0,255] float
+    if x_max > 1.5:          # looks like [0,255] float
         x = x / 255.0
-    elif x_min < -0.1:    # looks like [-0.5,0.5]
-        x = x + 0.5
+        x = x - 0.5
+    elif x_min >= -0.1:      # looks like [0,1] float
+        x = x - 0.5
+    # else: assume already [-0.5,0.5]
 
-    return x.clamp(0.0, 1.0)
+    return x.clamp(-0.5, 0.5)
 
 
 class AEImageDataset(Dataset):
-    """Yields CHW float32 in [0,1]."""
+    """Yields CHW float32 in [-0.5, 0.5]."""
     def __init__(self, images_bchw: Union[np.ndarray, torch.Tensor]):
-        x = _as_bchw_float01(images_bchw).contiguous()  # BCHW float01
-        self.x = x
+        self.x = _as_bchw_float(images_bchw).contiguous()  # BCHW float in [-0.5,0.5]
 
     def __len__(self):
         return int(self.x.shape[0])
 
     def __getitem__(self, idx):
-        return self.x[idx]  # CHW
+        return self.x[idx]  # CHW float in [-0.5,0.5]
 
 
 class StateAutoEncoderModel(nn.Module):
     """
-    Simple convolutional autoencoder for learning compact representations of image observations 
-    for hashing.
+    Convolutional autoencoder for learning compact representations of image observations.
 
-    - Training batches are BCHW float32 in [0,1]
+    - Training batches are BCHW float32 in [-0.5, 0.5]
     - Encoder outputs:
         z_logits: (B, D) pre-sigmoid
-        b_soft  : (B, D) post-sigmoid in [0,1]
+        b_soft : (B, D) post-sigmoid in [0,1]
     - Representation returned by get_representation():
         (D,) float32 for a single observation, optionally z-scored
     """
@@ -116,7 +118,7 @@ class StateAutoEncoderModel(nn.Module):
         self._dataloader_generator = torch.Generator(device="cpu").manual_seed(self._seed)
         self._torch_gen = torch.Generator(device=self._device).manual_seed(self._seed + 1)
 
-        # Encoder: x01 (B,C,64,64) -> z_logits (B,D)
+        # Encoder: x (B,C,64,64) in [-0.5,0.5] -> z_logits (B,D)
         self._encoder_net = nn.Sequential(
             nn.Conv2d(C, 32, kernel_size=8, stride=4),  # 64 -> 15, downsample + extract low-level features (edges/colors)
             nn.ReLU(inplace=True),  # nonlinearity
@@ -129,11 +131,16 @@ class StateAutoEncoderModel(nn.Module):
             nn.AdaptiveAvgPool2d((1, 1)),  # -> (B,64,1,1),  global pooling
             nn.Flatten(),  # (B,64,1,1) -> (B,64)
             nn.LayerNorm(64),  # Stabilize feature scale before projection
-            nn.Linear(64, self._latent_dim),  # Project to latent logits (hash representation space)
+
+            # MLP projection to latent space (logits for hash representation)
+            nn.Linear(64, 128),
+            nn.ReLU(),
+            nn.Linear(128, self._latent_dim),  # Latent (z) logits, the rep that will be hashed
+            
             nn.LayerNorm(self._latent_dim),  # Stabilize latent scale across dims
         )
 
-        # Decoder: b_soft -> recon
+        # Decoder: b_soft -> recon in [-0.5,0.5]
         self._decoder_seed = nn.Sequential(
             nn.Linear(self._latent_dim, 64),  # Map latent back to decoder channel space
             nn.ReLU(inplace=True),
@@ -148,7 +155,7 @@ class StateAutoEncoderModel(nn.Module):
             nn.ConvTranspose2d(32, 32, 4, 2, 1),  # Upsample 16 -> 32
             nn.ReLU(inplace=True),
             nn.ConvTranspose2d(32, C, 4, 2, 1),  # Upsample 32 -> 64, restore channels
-            nn.Sigmoid(),  # Output in [0,1] for BCE reconstruction loss
+            nn.Tanh(),  # Output in [-1,1] for MSE reconstruction loss
         )
 
         self._encoder_net = self._encoder_net.to(self._device)
@@ -164,8 +171,7 @@ class StateAutoEncoderModel(nn.Module):
         params = list(self._encoder_net.parameters()) + list(self._decoder_seed.parameters()) + list(self._decoder_deconv.parameters())
         self._optimizer = optimizer_fn(params, lr=lr, weight_decay=weight_decay)
 
-        # --- representation normalization state (torch tensors) ---
-        # Store as buffers so they follow device + get saved in state_dict
+        # Representation normalization state
         self.register_buffer("_repr_mean_t", torch.zeros(self._latent_dim, dtype=torch.float32))
         self.register_buffer("_repr_std_t", torch.ones(self._latent_dim, dtype=torch.float32))
         self._repr_stats_ready = False
@@ -229,25 +235,26 @@ class StateAutoEncoderModel(nn.Module):
 
     # Core forward pieces
 
-    def encode(self, x01_bchw: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def encode(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        x01_bchw: BCHW float in [0,1]
+        x: BCHW float in [-0.5,0.5]
         returns: (z_logits, b_soft)
         """
-        x01 = x01_bchw.to(self._device)
-        z_logits = self._encoder_net(x01)
+        x = x.to(self._device)
+        z_logits = self._encoder_net(x)
         b_soft = torch.sigmoid(z_logits)
         return z_logits, b_soft
 
     def decode(self, b_soft_bD: torch.Tensor) -> torch.Tensor:
         seed_vec = self._decoder_seed(b_soft_bD)
         seed = seed_vec.view(-1, 64, 1, 1)
-        recon = self._decoder_deconv(seed)
+        recon = self._decoder_deconv(seed)  # [-1,1] because Tanh
+        recon = 0.5 * recon  # [-0.5,0.5]
         return recon
 
     def calculate_loss(
         self,
-        x01_bchw: torch.Tensor,
+        x: torch.Tensor,
         lambda_binarize: float = 1e-3,
         noise_a: float = 0.3,
         lambda_bal: float = 1e-2,
@@ -255,13 +262,13 @@ class StateAutoEncoderModel(nn.Module):
         lambda_ent: float = 1e-3,
     ):
         """
-        x01_bchw: BCHW float32 in [0,1]
+        x: BCHW float32 in [-0.5,0.5]
         """
-        x01 = x01_bchw.to(self._device)
+        x = x.to(self._device)
 
-        z_logits, b_soft = self.encode(x01)
+        z_logits, b_soft = self.encode(x)
 
-        # anti-collapse (on soft bits)
+        # Anti-collapse (on soft bits)
         bit_mean = b_soft.mean(dim=0).clamp(1e-3, 1 - 1e-3)
         balance_loss = ((bit_mean - 0.5) ** 2).mean()
 
@@ -277,7 +284,7 @@ class StateAutoEncoderModel(nn.Module):
         entropy_push = (b_soft * (1 - b_soft)).mean()
         anti_collapse = lambda_bal * balance_loss + lambda_dec * decorrel_loss + lambda_ent * entropy_push
 
-        # noise for robustness
+        # Noise for robustness
         if self.training and noise_a and noise_a > 0:
             noise = (2 * noise_a) * torch.rand(b_soft.shape, device=b_soft.device, generator=self._torch_gen) - noise_a
             b_used = torch.clamp(b_soft + noise, 0.0, 1.0)
@@ -286,7 +293,7 @@ class StateAutoEncoderModel(nn.Module):
 
         recon = self.decode(b_used)
 
-        recon_loss = F.binary_cross_entropy(recon, x01, reduction="mean")
+        recon_loss = F.mse_loss(recon, x, reduction="mean")
 
         # Encourages bits to be close to 0 or 1 (soft binarization)
         dist0 = b_soft.pow(2)
@@ -336,14 +343,14 @@ class StateAutoEncoderModel(nn.Module):
             running = {}
             n = 0
 
-            for x01_chw in loader:
-                # Dataset yields CHW float01, dataloader stacks -> BCHW float01
-                x01 = x01_chw.to(self._device, non_blocking=(self._device.type == "cuda"))
+            for x in loader:
+                # Dataset yields CHW float32 in [-0.5, 0.5]; DataLoader stacks -> BCHW float32
+                x = x.to(self._device, non_blocking=(self._device.type == "cuda"))
 
                 self._optimizer.zero_grad(set_to_none=True)
 
                 total, stats, _, _, _ = self.calculate_loss(
-                    x01, lambda_binarize=lambda_binarize, noise_a=noise_a
+                    x, lambda_binarize=lambda_binarize, noise_a=noise_a
                 )
 
                 total.backward()
@@ -351,7 +358,7 @@ class StateAutoEncoderModel(nn.Module):
                     torch.nn.utils.clip_grad_value_(self._encoder_net.parameters(), self._grad_clip)
                 self._optimizer.step()
 
-                bs = int(x01.shape[0])
+                bs = int(x.shape[0])
                 for k, v in stats.items():
                     running[k] = running.get(k, 0.0) + float(v) * bs
                 n += bs
@@ -386,13 +393,13 @@ class StateAutoEncoderModel(nn.Module):
         if obs is None:
             raise ValueError("learn_representation_stats: data missing 'observation'")
 
-        obs_bchw = _as_bchw_float01(obs)  # CPU BCHW float01
+        obs = _as_bchw_float(obs)  # CPU BCHW in [-0.5,0.5]
 
         reps = []
-        N = int(obs_bchw.shape[0])
+        N = int(obs.shape[0])
         for s in range(0, N, int(batch_size)):
-            x01 = obs_bchw[s : s + int(batch_size)].to(self._device, non_blocking=(self._device.type == "cuda"))
-            z_logits, b_soft = self.encode(x01)
+            x = obs[s : s + int(batch_size)].to(self._device, non_blocking=(self._device.type == "cuda"))
+            z_logits, b_soft = self.encode(x)
             rep = z_logits
             reps.append(rep.float().cpu())
 
@@ -424,8 +431,8 @@ class StateAutoEncoderModel(nn.Module):
     @torch.no_grad()
     def get_representation(self, obs) -> np.ndarray:
         """
-        Accepts: CHW uint8, HWC uint8, BCHW, or BHWC.
-        Returns: (D,) float32 rep.
+        Accepts: CHW/HWC/BCHW/BHWC, uint8 or float.
+        Returns: (D,) float32 rep (logits), optionally normalized.
         """
         self.eval()
 
@@ -448,9 +455,9 @@ class StateAutoEncoderModel(nn.Module):
         else:
             raise ValueError(f"Expected 3D/4D image, got {tuple(x.shape)}")
 
-        x01 = _as_bchw_float01(x).to(self._device, non_blocking=(self._device.type == "cuda"))
+        x = _as_bchw_float(x).to(self._device, non_blocking=(self._device.type == "cuda"))
 
-        z_logits, _ = self.encode(x01)
+        z_logits, _ = self.encode(x)
         rep = z_logits  # (1,D)
 
         if self._normalize_representations:

@@ -287,8 +287,7 @@ class ReplayBuffer:
 
     def get_data(self):
         data = {
-            # Keep as uint8, no torch, no float32, no normalization here
-            "observation": self.observations[: self.idx].copy(),  # uint8
+            "observation": self.observations[: self.idx].copy(),  # uint8 CHW
             "terminal": self.terminals[: self.idx].copy(),
         }
         if self.ae_process:
