@@ -108,6 +108,8 @@ class StateAutoEncoderModel(nn.Module):
         self._grad_clip = float(grad_clip)
 
         self._normalize_representations = bool(normalize_representations)
+        self._repr_mean = None
+        self._repr_std  = None
 
         C, H, W = in_dim
         assert C in (1, 3), f"Expected C=1 or 3, got {C}"
@@ -170,11 +172,6 @@ class StateAutoEncoderModel(nn.Module):
             optimizer_fn = torch.optim.Adam
         params = list(self._encoder_net.parameters()) + list(self._decoder_seed.parameters()) + list(self._decoder_deconv.parameters())
         self._optimizer = optimizer_fn(params, lr=lr, weight_decay=weight_decay)
-
-        # Representation normalization state
-        self.register_buffer("_repr_mean_t", torch.zeros(self._latent_dim, dtype=torch.float32))
-        self.register_buffer("_repr_std_t", torch.ones(self._latent_dim, dtype=torch.float32))
-        self._repr_stats_ready = False
 
         self._compile_encoder = bool(compile_encoder)
         self.enable_fast_inference(use_half=False, compile_encoder=self._compile_encoder)
@@ -339,7 +336,7 @@ class StateAutoEncoderModel(nn.Module):
 
         last_epoch_stats = {}
 
-        for epoch in range(int(num_epochs)):
+        for _ in range(int(num_epochs)):
             running = {}
             n = 0
 
@@ -384,88 +381,62 @@ class StateAutoEncoderModel(nn.Module):
     # Representation stats + extraction
 
     @torch.no_grad()
-    def learn_representation_stats(self, data: Dict[str, Any], batch_size: int = 256) -> Dict[str, float]:
-        """
-        Computes mean/std over logits across data["observation"].
-        Stores as torch tensors on self._device.
-        """
-        obs = data.get("observation", None)
-        if obs is None:
-            raise ValueError("learn_representation_stats: data missing 'observation'")
+    def learn_representation_stats(self, data):
+        """Compute mean/std of representations for normalization."""
+        obs = torch.as_tensor(data["observation"], device=self._device).float()  # BCHW float [-0.5,0.5]
 
-        obs = _as_bchw_float(obs)  # CPU BCHW in [-0.5,0.5]
+        obs = obs.float()
 
-        reps = []
-        N = int(obs.shape[0])
-        for s in range(0, N, int(batch_size)):
-            x = obs[s : s + int(batch_size)].to(self._device, non_blocking=(self._device.type == "cuda"))
-            z_logits, b_soft = self.encode(x)
-            rep = z_logits
-            reps.append(rep.float().cpu())
+        self.eval()
+        self._encoder_net.eval()
 
-        R = torch.cat(reps, dim=0)  # CPU (N,D)
-        mean = R.mean(dim=0)
-        std = R.std(dim=0, unbiased=False).clamp_min(1e-8)
+        z_logits, _ = self.encode(obs)  # (N, D)
+        reprs = z_logits.detach().float().cpu().numpy()
+
+        stats = {
+            "ae_out_min": float(reprs.min()),
+            "ae_out_max": float(reprs.max()),
+            "ae_out_mean": float(reprs.mean()),
+            "ae_out_std": float(reprs.std()),
+            "ae_out_abs_mean": float(np.mean(np.abs(reprs))),
+            "ae_out_p01": float(np.quantile(reprs, 0.01)),
+            "ae_out_p50": float(np.quantile(reprs, 0.50)),
+            "ae_out_p99": float(np.quantile(reprs, 0.99)),
+            "ae_out_norm_mean": float(np.mean(np.linalg.norm(reprs, axis=1))),
+            "ae_out_norm_p99": float(np.quantile(np.linalg.norm(reprs, axis=1), 0.99)),
+        }
 
         if self._normalize_representations:
-            self._repr_mean_t.copy_(mean.to(self._repr_mean_t.device))
-            self._repr_std_t.copy_(std.to(self._repr_std_t.device))
-            self._repr_stats_ready = True
+            self._repr_mean = reprs.mean(axis=0)
+            self._repr_std = reprs.std(axis=0) + 1e-8
 
-        r_np = R.numpy()
-        norms = np.linalg.norm(r_np, axis=1)
+            z = (reprs - self._repr_mean) / self._repr_std
+            stats.update({
+                "ae_out_normed_min": float(z.min()),
+                "ae_out_normed_max": float(z.max()),
+                "ae_out_normed_mean": float(z.mean()),
+                "ae_out_normed_std": float(z.std()),
+                "ae_out_normed_p01": float(np.quantile(z, 0.01)),
+                "ae_out_normed_p99": float(np.quantile(z, 0.99)),
+            })
 
-        out = {
-            "rep_min": float(r_np.min()),
-            "rep_max": float(r_np.max()),
-            "rep_mean": float(r_np.mean()),
-            "rep_std": float(r_np.std()),
-            "rep_norm_mean": float(norms.mean()),
-            "rep_norm_p99": float(np.quantile(norms, 0.99)),
-            "repr_mean_abs_mean": float(mean.abs().mean().item()),
-            "repr_std_mean": float(std.mean().item()),
-            "repr_std_min": float(std.min().item()),
-        }
-        return out
+        return stats
 
     @torch.no_grad()
-    def get_representation(self, obs) -> np.ndarray:
-        """
-        Accepts: CHW/HWC/BCHW/BHWC, uint8 or float.
-        Returns: (D,) float32 rep (logits), optionally normalized.
-        """
+    def get_representation(self, obs):
+        obs = obs.to(self._device).float()
+        if obs.ndim == 3:
+            obs = obs.unsqueeze(0)
+
         self.eval()
+        self._encoder_net.eval()
 
-        x = obs
-        if isinstance(x, np.ndarray):
-            x = torch.from_numpy(x)
-        elif not torch.is_tensor(x):
-            x = torch.as_tensor(x)
+        z_logits, _ = self.encode(obs)  # (1,D)
+        reprs = z_logits.squeeze(0).detach().cpu().numpy()  # (D,)
 
-        if x.ndim == 3:
-            # If it's HWC, convert to CHW
-            if x.shape[0] not in (1, 3) and x.shape[-1] in (1, 3):
-                x = x.permute(2, 0, 1)
-            x = x.unsqueeze(0)  # -> BCHW
-
-        elif x.ndim == 4:
-            # If it's BHWC, convert to BCHW
-            if x.shape[1] not in (1, 3) and x.shape[-1] in (1, 3):
-                x = x.permute(0, 3, 1, 2)
-        else:
-            raise ValueError(f"Expected 3D/4D image, got {tuple(x.shape)}")
-
-        x = _as_bchw_float(x).to(self._device, non_blocking=(self._device.type == "cuda"))
-
-        z_logits, _ = self.encode(x)
-        rep = z_logits  # (1,D)
-
-        if self._normalize_representations:
-            if not self._repr_stats_ready:
-                raise RuntimeError("normalize_representations=True but stats not learned yet")
-            rep = (rep - self._repr_mean_t) / self._repr_std_t
-
-        return rep[0].detach().cpu().numpy().astype(np.float32, copy=False)
+        if self._normalize_representations and (self._repr_mean is not None):
+            reprs = (reprs - self._repr_mean) / self._repr_std
+        return reprs
 
 
     # Fast inference / compile
@@ -500,9 +471,8 @@ class StateAutoEncoderModel(nn.Module):
                 "latent_dim": self._latent_dim,
                 "normalize_representations": self._normalize_representations,
 
-                "repr_mean_t": self._repr_mean_t.detach().cpu(),
-                "repr_std_t": self._repr_std_t.detach().cpu(),
-                "repr_stats_ready": self._repr_stats_ready,
+                "repr_mean": self._repr_mean,
+                "repr_std": self._repr_std,
             },
             os.path.join(dname, "ae_hash_model.pt"),
         )
@@ -517,14 +487,11 @@ class StateAutoEncoderModel(nn.Module):
         self._decoder_deconv.load_state_dict(ckpt["decoder_deconv"])
         self._optimizer.load_state_dict(ckpt["optimizer"])
 
-        self._normalize_representations = bool(ckpt.get("normalize_representations", self._normalize_representations))
-
-        mean = ckpt.get("repr_mean_t", None)
-        std = ckpt.get("repr_std_t", None)
-        if mean is not None and std is not None:
-            self._repr_mean_t.copy_(mean.to(self._repr_mean_t.device))
-            self._repr_std_t.copy_(std.to(self._repr_std_t.device))
-            self._repr_stats_ready = bool(ckpt.get("repr_stats_ready", True))
+        self._repr_mean = ckpt.get("repr_mean", None)
+        self._repr_std = ckpt.get("repr_std", None)
+        self._normalize_representations = ckpt.get(
+            "normalize_representations", self._normalize_representations
+        )
 
         self._encoder_net.to(self._device).eval()
         self._decoder_seed.to(self._device).eval()

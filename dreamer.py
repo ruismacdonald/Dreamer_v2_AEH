@@ -1,3 +1,4 @@
+from html import parser
 import os
 import random
 import time
@@ -759,9 +760,6 @@ def main():
     parser.add_argument("--loca-hash-count", type=int, default=2000, help="")
 
     parser.add_argument("--normalize-representations", action="store_true", help="")
-    parser.add_argument("--resume-steps", type=int, default=0, help="Resume global_step (environment steps, after action_repeat)")
-    parser.add_argument("--ae-model-path", type=str, default="", help="Dictory containing ae_model.pt to load")
-    parser.add_argument("--skip-aem-train", action="store_true", help="If set do not collect/train state ae model")
 
     args = parser.parse_args()
 
@@ -812,32 +810,29 @@ def main():
 
     if args.loca_state_ae:
         state_ae_model = StateAutoEncoderModel(
-            obs_shape, torch.optim.Adam, latent_dim=args.loca_latent_size, device=device, normalize_representations=args.normalize_representations
+            obs_shape, torch.optim.Adam, device=device, latent_dim=args.loca_latent_size, normalize_representations=args.normalize_representations
         )
 
-        print("Start state AE learning process.")
+        print("Start state ae learning process.")
         num_state_ae_steps = 100000
         _ = dreamer.collect_random_episodes(
             train_env, num_state_ae_steps // args.action_repeat
         )
 
-        print("Start training state AE model.")
+        print("Start training state ae model.")
         
-        sdm_stats = state_ae_model.train_on_buffer(dreamer.data_buffer)
-        logger.log_scalars(sdm_stats, step=dreamer.data_buffer.steps * args.action_repeat)
-        logger.flush()
-        print(
-            "normalize:", state_ae_model._normalize_representations,
-            "stats ready:", state_ae_model._repr_stats_ready,
-            "mean shape:", tuple(state_ae_model._repr_mean_t.shape),
-            "std shape:", tuple(state_ae_model._repr_std_t.shape),
-        )
+        sae_stats = state_ae_model.train_on_buffer(dreamer.data_buffer)
+        logger.log_scalars(sae_stats, step=dreamer.data_buffer.steps * args.action_repeat)
+
+        print("normalize:", state_ae_model._normalize_representations,
+              "mean set:", state_ae_model._repr_mean is not None,
+              "std set:", state_ae_model._repr_std is not None)
 
         ckpt_dir = os.path.join(logdir, "ckpts/")
         if not (os.path.exists(ckpt_dir)):
             os.makedirs(ckpt_dir)
         state_ae_model.save(ckpt_dir)
-        print("Finish state AE learning process.")
+        print("Finish state ae learning process.")
 
         dreamer = Dreamer(
             args,

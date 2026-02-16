@@ -14,7 +14,7 @@ class ReplayBuffer:
             - Additionally maintains per-hash FIFO queues of *global indices* to decide
                 which transitions are "kept" vs "discarded" (local forgetting).
 
-    SimHash key from the state-ae representation passed to add():
+    SimHash key from the state ae representation passed to add():
         dots = rep @ A_latent.T  # (hash_bits,)
         bits = (dots >= 0).astype(np.uint8)  # (hash_bits,)
         packed = np.packbits(bits, bitorder=...)  # bytes key
@@ -75,10 +75,6 @@ class ReplayBuffer:
         self.flat_pos = np.full(self.size, -1, dtype=np.int64)  # idx -> position in loca_indices_flat
         self.insert_id = np.zeros(self.size, dtype=np.int64)  # generation stamp per slot
         self._global_insert_id = 0
-
-        # # Use a dedicated RNG so we never call np.random.choice() on a Python list
-        # # (np.random.choice(list) converts list -> array each call, which is slow).
-        # self._rng = np.random.default_rng(seed)
 
         # SimHash-bucketed state
         if self.ae_process:
@@ -219,7 +215,7 @@ class ReplayBuffer:
         self.episodes += (1 if done else 0)
 
     # Sampling
-    
+
     def _sample_idx(self, L):
         """Standard Dreamer sampling from the global ring."""
         valid_idx = False
@@ -228,8 +224,9 @@ class ReplayBuffer:
             idxs = np.arange(idx, idx + L) % self.size
             valid_idx = self.idx not in idxs[1:]
         return idxs
-
+    
     def _sample_idx_ae(self, L: int):
+        """AE-process sampling: choose START from currently-kept indices, then return temporal window."""
         if len(self.loca_indices_flat) == 0:
             raise RuntimeError("No kept indices available yet (loca_indices_flat is empty).")
 
@@ -237,6 +234,7 @@ class ReplayBuffer:
         while not valid_idx:
             start = int(np.random.choice(self.loca_indices_flat))
             idxs = (np.arange(start, start + L) % self.size).astype(np.int64)
+            # match original: don't cross the current write position in the middle of a sequence
             valid_idx = self.idx not in idxs[1:]
         return idxs
 
