@@ -81,8 +81,8 @@ python -u "$DREAMER_SRC/dreamer.py" \
   --train \
   --loca-all-phases \
   --buffer-size 2500000 \
-  --loca-phase1-steps 1000000 \
-  --loca-phase2-steps 1500000 \
+  --loca-phase1-steps 1500000 \
+  --loca-phase2-steps 3500000 \
   --loca-phase3-steps 0 \
   --loca-state-ae \
   --loca-latent-size 256 \
