@@ -845,6 +845,9 @@ def main():
         )
 
     if args.train:
+        logger.log_scalars({"train_avg_reward": 0.0, "eval_avg_reward": 0.0}, step=0)
+        logger.flush()
+        
         initial_logs = OrderedDict()
         seed_episode_rews = dreamer.collect_random_episodes(
             train_env, args.seed_steps // args.action_repeat
@@ -876,7 +879,7 @@ def main():
             }
         )
 
-        logger.log_scalars(initial_logs, step=0)
+        logger.log_scalars(initial_logs, step=global_step)
         logger.flush()
 
         while global_step <= total_steps:
