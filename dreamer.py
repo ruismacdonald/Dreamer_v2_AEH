@@ -79,7 +79,7 @@ class Dreamer:
         self.restore_path = args.checkpoint_path
 
         self.loca_state_ae = loca_state_ae
-        self.state_ae_model = None
+        self.state_ae_model = state_ae_model
         if self.loca_state_ae:
             self.data_buffer = ReplayBuffer(
                 self.args.buffer_size,
@@ -755,11 +755,11 @@ def main():
     parser.add_argument("--loca-phase3-steps", type=int, default=0, help="")
 
     parser.add_argument("--loca-state-ae", action="store_true", help="")
-    parser.add_argument("--loca-latent-size", type=int, default=256, help="")
     parser.add_argument("--loca-hash-size", type=int, default=32)
     parser.add_argument("--loca-hash-count", type=int, default=2000, help="")
 
     parser.add_argument("--normalize-representations", action="store_true", help="")
+    parser.add_argument("--loca-latent-size", type=int, default=256, help="")
 
     args = parser.parse_args()
 
@@ -821,9 +821,7 @@ def main():
 
         print("Start training state ae model.")
         
-        sae_stats = state_ae_model.train_on_buffer(dreamer.data_buffer)
-        logger.log_scalars(sae_stats, step=dreamer.data_buffer.steps * args.action_repeat)
-
+        state_ae_model.train_on_buffer(dreamer.data_buffer)
         print("normalize:", state_ae_model._normalize_representations,
               "mean set:", state_ae_model._repr_mean is not None,
               "std set:", state_ae_model._repr_std is not None)
@@ -832,7 +830,7 @@ def main():
         if not (os.path.exists(ckpt_dir)):
             os.makedirs(ckpt_dir)
         state_ae_model.save(ckpt_dir)
-        print("Finish state ae learning process.")
+        print("Finished state ae learning process.")
 
         dreamer = Dreamer(
             args,
@@ -845,9 +843,6 @@ def main():
         )
 
     if args.train:
-        logger.log_scalars({"train_avg_reward": 0.0, "eval_avg_reward": 0.0}, step=0)
-        logger.flush()
-        
         initial_logs = OrderedDict()
         seed_episode_rews = dreamer.collect_random_episodes(
             train_env, args.seed_steps // args.action_repeat
@@ -879,7 +874,7 @@ def main():
             }
         )
 
-        logger.log_scalars(initial_logs, step=global_step)
+        logger.log_scalars(initial_logs, step=0)
         logger.flush()
 
         while global_step <= total_steps:

@@ -226,7 +226,7 @@ class ReplayBuffer:
         return idxs
     
     def _sample_idx_ae(self, L: int):
-        """AE-process sampling: choose START from currently-kept indices, then return temporal window."""
+        """AE process sampling: choose START from currently-kept indices, then return temporal window."""
         if len(self.loca_indices_flat) == 0:
             raise RuntimeError("No kept indices available yet (loca_indices_flat is empty).")
 
