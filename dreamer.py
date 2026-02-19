@@ -79,7 +79,7 @@ class Dreamer:
         self.restore_path = args.checkpoint_path
 
         self.loca_state_ae = loca_state_ae
-        self.state_ae_model = state_ae_model
+        self.state_ae_model = None
         if self.loca_state_ae:
             self.data_buffer = ReplayBuffer(
                 self.args.buffer_size,
