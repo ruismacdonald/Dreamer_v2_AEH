@@ -68,7 +68,7 @@ export LOCA_DATALOADER_WORKERS=0
 : "${SLURM_TMPDIR:=/tmp}"
 SEED="${SLURM_ARRAY_TASK_ID}"
 
-RUN_DIR="${SLURM_TMPDIR}/dreamer-v2-aeh-rr-${SLURM_JOB_ID:-0}-${SEED}"
+RUN_DIR="${SLURM_TMPDIR}/dreamer-v2-state_ae-${SLURM_JOB_ID:-0}-${SEED}"
 FINAL_DIR="${BASE_SAVE_DIR}/${SEED}"
 mkdir -p "$RUN_DIR" "$FINAL_DIR"
 

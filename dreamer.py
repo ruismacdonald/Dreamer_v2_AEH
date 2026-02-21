@@ -87,7 +87,7 @@ class Dreamer:
                 self.action_size,
                 self.args.train_seq_len,
                 self.args.batch_size,
-                ae_process=True,
+                distance_process=True,
                 obs_hash_size=self.args.loca_hash_size,
                 obs_hash_count=self.args.loca_hash_count,
                 seed=self.args.seed,
@@ -755,11 +755,14 @@ def main():
     parser.add_argument("--loca-phase3-steps", type=int, default=0, help="")
 
     parser.add_argument("--loca-state-ae", action="store_true", help="")
+    parser.add_argument("--loca-latent-size", type=int, default=256, help="")
     parser.add_argument("--loca-hash-size", type=int, default=32)
     parser.add_argument("--loca-hash-count", type=int, default=2000, help="")
 
     parser.add_argument("--normalize-representations", action="store_true", help="")
-    parser.add_argument("--loca-latent-size", type=int, default=256, help="")
+    parser.add_argument("--resume-steps", type=int, default=0, help="Resume global_step (environment steps, after action_repeat)")
+    parser.add_argument("--ae-model-path", type=str, default="", help="Directory containing ae_model.pt to load")
+    parser.add_argument("--skip-ae-train", action="store_true", help="If set do not collect/train state ae model")
 
     args = parser.parse_args()
 
@@ -805,6 +808,9 @@ def main():
     obs_shape = train_env.observation_space["image"].shape
     action_size = train_env.action_space.shape[0]
     dreamer = Dreamer(args, obs_shape, action_size, device, args.restore)
+    # If resuming, force the step counter used by phase switching/logging
+    if args.restore and args.resume_steps > 0:
+        dreamer.data_buffer.steps = args.resume_steps // args.action_repeat
 
     logger = Logger(logdir)
 
@@ -813,24 +819,30 @@ def main():
             obs_shape, torch.optim.Adam, device=device, latent_dim=args.loca_latent_size, normalize_representations=args.normalize_representations
         )
 
-        print("Start state ae learning process.")
-        num_state_ae_steps = 100000
-        _ = dreamer.collect_random_episodes(
-            train_env, num_state_ae_steps // args.action_repeat
-        )
+        if args.skip_ae_train:
+            if not args.ae_model_path:
+                raise ValueError("--skip-ae-train requires --ae-model-path")
+            state_ae_model.load(args.ae_model_path)
+            print(f"Loaded state ae model from {args.ae_model_path}")
+        else:
+            print("Start state ae learning process.")
+            num_state_ae_steps = 100000
+            _ = dreamer.collect_random_episodes(
+                train_env, num_state_ae_steps // args.action_repeat
+            )
 
-        print("Start training state ae model.")
-        
-        state_ae_model.train_on_buffer(dreamer.data_buffer)
-        print("normalize:", state_ae_model._normalize_representations,
-              "mean set:", state_ae_model._repr_mean is not None,
-              "std set:", state_ae_model._repr_std is not None)
+            print("Start training state ae model.")
+            
+            state_ae_model.train(dreamer.data_buffer.get_data())
+            print("normalize:", state_ae_model._normalize_representations,
+                  "mean set:", state_ae_model._repr_mean is not None,
+                  "std set:", state_ae_model._repr_std is not None)
 
-        ckpt_dir = os.path.join(logdir, "ckpts/")
-        if not (os.path.exists(ckpt_dir)):
-            os.makedirs(ckpt_dir)
-        state_ae_model.save(ckpt_dir)
-        print("Finished state ae learning process.")
+            ckpt_dir = os.path.join(logdir, "ckpts/")
+            if not (os.path.exists(ckpt_dir)):
+                os.makedirs(ckpt_dir)
+            state_ae_model.save(ckpt_dir)
+            print("Finish state ae learning process.")
 
         dreamer = Dreamer(
             args,

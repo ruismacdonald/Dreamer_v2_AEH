@@ -14,7 +14,7 @@ class ReplayBuffer:
             - Additionally maintains per-hash FIFO queues of *global indices* to decide
                 which transitions are "kept" vs "discarded" (local forgetting).
 
-    SimHash key from the state ae representation passed to add():
+    SimHash key from the state-ae representation passed to add():
         dots = rep @ A_latent.T  # (hash_bits,)
         bits = (dots >= 0).astype(np.uint8)  # (hash_bits,)
         packed = np.packbits(bits, bitorder=...)  # bytes key
@@ -226,7 +226,7 @@ class ReplayBuffer:
         return idxs
     
     def _sample_idx_ae(self, L: int):
-        """AE process sampling: choose START from currently-kept indices, then return temporal window."""
+        """AE-process sampling: choose START from currently-kept indices, then return temporal window."""
         if len(self.loca_indices_flat) == 0:
             raise RuntimeError("No kept indices available yet (loca_indices_flat is empty).")
 

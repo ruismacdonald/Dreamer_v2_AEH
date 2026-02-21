@@ -5,7 +5,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
 #SBATCH --exclude=ng[11105,30708]
-#SBATCH --mem=32G
+#SBATCH --mem=62G
 #SBATCH --array=0
 #SBATCH --acctg-freq=task=1
 #SBATCH --output=/home/ruism/projects/def-rsdjjana/ruism/Dreamer_v2_AEH/results/reacherloca_v2_rep_norm_state_ae/%A-%a.out
@@ -68,7 +68,7 @@ export LOCA_DATALOADER_WORKERS=0
 : "${SLURM_TMPDIR:=/tmp}"
 SEED="${SLURM_ARRAY_TASK_ID}"
 
-RUN_DIR="${SLURM_TMPDIR}/dreamer-v2-aeh-r-rep-norm-${SLURM_JOB_ID:-0}-${SEED}"
+RUN_DIR="${SLURM_TMPDIR}/dreamer-v2-state_ae-${SLURM_JOB_ID:-0}-${SEED}"
 FINAL_DIR="${BASE_SAVE_DIR}/${SEED}"
 mkdir -p "$RUN_DIR" "$FINAL_DIR"
 
