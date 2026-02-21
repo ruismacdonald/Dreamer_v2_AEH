@@ -833,7 +833,7 @@ def main():
 
             print("Start training state ae model.")
             
-            state_ae_model.train(dreamer.data_buffer.get_data())
+            state_ae_model.train_on_buffer(dreamer.data_buffer)
             print("normalize:", state_ae_model._normalize_representations,
                   "mean set:", state_ae_model._repr_mean is not None,
                   "std set:", state_ae_model._repr_std is not None)
