@@ -87,7 +87,7 @@ class Dreamer:
                 self.action_size,
                 self.args.train_seq_len,
                 self.args.batch_size,
-                distance_process=True,
+                ae_process=True,
                 obs_hash_size=self.args.loca_hash_size,
                 obs_hash_count=self.args.loca_hash_count,
                 seed=self.args.seed,
