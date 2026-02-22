@@ -262,26 +262,41 @@ class ReplayBuffer:
         return obs, acs, rews, terms, reward_mask
 
     def report_statistics(self):
-        if not self.ae_process:
+        if not self.distance_process:
+            # Only log scalars here
+            if self.full:
+                rewards_view = self.rewards
+            else:
+                rewards_view = self.rewards[: self.idx]
+
+            if rewards_view.size == 0:
+                return {
+                    "buffer_reward_unique_count": 0,
+                    "buffer_reward_min": 0.0,
+                    "buffer_reward_max": 0.0,
+                    "buffer_reward_mean": 0.0,
+                }
+
+            unique_rewards, counts = np.unique(rewards_view, return_counts=True)
             return {
-                "rewards_statistics": [
-                    (float(r), int(cnt))
-                    for r, cnt in zip(*np.unique(self.rewards, return_counts=True))
-                ]
+                "buffer_reward_unique_count": int(len(unique_rewards)),
+                "buffer_reward_min": float(np.min(rewards_view)),
+                "buffer_reward_max": float(np.max(rewards_view)),
+                "buffer_reward_mean": float(np.mean(rewards_view)),
+                "buffer_reward_mode_count": int(np.max(counts)),  # optional diagnostic
             }
 
-        # ae_process=True
+        # distance_process=True
         fifo_sizes = [len(dq) for dq in self.loca_indices.values()]
         total = int(np.sum(fifo_sizes)) if fifo_sizes else 0
+
         return {
-            "num_fifos": len(self.loca_indices),
-            "kept_starts": len(self.loca_indices_flat),
+            "num_fifos": int(len(self.loca_indices)),
+            "kept_starts": int(len(self.loca_indices_flat)),
             "total_indices_in_fifos": total,
-            "fifo_size_statistics": {
-                "min": int(np.min(fifo_sizes)) if fifo_sizes else 0,
-                "max": int(np.max(fifo_sizes)) if fifo_sizes else 0,
-                "mean": float(np.mean(fifo_sizes)) if fifo_sizes else 0.0,
-            },
+            "fifo_size_min": int(np.min(fifo_sizes)) if fifo_sizes else 0,
+            "fifo_size_max": int(np.max(fifo_sizes)) if fifo_sizes else 0,
+            "fifo_size_mean": float(np.mean(fifo_sizes)) if fifo_sizes else 0.0,
         }
 
     def get_data(self):
