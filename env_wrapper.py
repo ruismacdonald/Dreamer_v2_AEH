@@ -62,6 +62,7 @@ class DeepMindControl:
 
 
 class DMCLoCA(DeepMindControl):
+    # Supports only reacherloca task
     def __init__(
         self,
         name,

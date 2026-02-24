@@ -74,10 +74,20 @@ class Logger:
 
     def log_scalars(self, scalar_dict, step):
         for key, value in scalar_dict.items():
-            print("{} : {}".format(key, value))
+            print(f"{key} : {value}")
+
+            # skip lists
             if isinstance(value, list):
                 continue
+
+            # flatten dicts
+            if isinstance(value, dict):
+                for subk, subv in value.items():
+                    self.log_scalar(subv, f"{key}/{subk}", step)
+                continue
+
             self.log_scalar(value, key, step)
+
         self.dump_scalars_to_pickle(scalar_dict, step)
 
     def log_videos(

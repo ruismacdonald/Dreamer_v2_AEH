@@ -762,7 +762,7 @@ def main():
     parser.add_argument("--normalize-representations", action="store_true", help="")
     parser.add_argument("--resume-steps", type=int, default=0, help="Resume global_step (environment steps, after action_repeat)")
     parser.add_argument("--ae-model-path", type=str, default="", help="Directory containing ae_model.pt to load")
-    parser.add_argument("--skip-ae-train", action="store_true", help="If set do not collect/train state ae model")
+    parser.add_argument("--skip-aem-train", action="store_true", help="If set do not collect/train state ae model")
 
     args = parser.parse_args()
 
@@ -819,11 +819,11 @@ def main():
             obs_shape, torch.optim.Adam, device=device, latent_dim=args.loca_latent_size, normalize_representations=args.normalize_representations
         )
 
-        if args.skip_ae_train:
+        if args.skip_aem_train:
             if not args.ae_model_path:
-                raise ValueError("--skip-ae-train requires --ae-model-path")
+                raise ValueError("--skip-aem-train requires --ae-model-path")
             state_ae_model.load(args.ae_model_path)
-            print(f"Loaded state ae model from {args.ae_model_path}")
+            print(f"Loaded state autoencoder model from {args.ae_model_path}")
         else:
             print("Start state ae learning process.")
             num_state_ae_steps = 100000
@@ -842,7 +842,8 @@ def main():
             if not (os.path.exists(ckpt_dir)):
                 os.makedirs(ckpt_dir)
             state_ae_model.save(ckpt_dir)
-            print("Finish state ae learning process.")
+
+            print("Finished state ae learning process.")
 
         dreamer = Dreamer(
             args,
