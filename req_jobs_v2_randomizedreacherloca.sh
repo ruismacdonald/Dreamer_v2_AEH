@@ -1,20 +1,20 @@
 #!/bin/bash
-#SBATCH --job-name=d_v2_rr_ae
+#SBATCH --job-name=d_v2_rr_ae_10
 #SBATCH --account=def-rsdjjana
 #SBATCH --time=6-23:59:59
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
 #SBATCH --exclude=ng[11105,30708]
 #SBATCH --mem=64G
-#SBATCH --array=0
+#SBATCH --array=1-10
 #SBATCH --acctg-freq=task=1
-#SBATCH --output=/home/ruism/projects/def-rsdjjana/ruism/Dreamer_v2_AEH/results/randomizedreacherloca_v2_state_ae/%A-%a.out
-#SBATCH --error=/home/ruism/projects/def-rsdjjana/ruism/Dreamer_v2_AEH/results/randomizedreacherloca_v2_state_ae/%A-%a.err
+#SBATCH --output=/home/ruism/projects/def-rsdjjana/ruism/Dreamer_v2_AEH/results/randomizedreacherloca_v2_state_ae_10seeds/%A-%a.out
+#SBATCH --error=/home/ruism/projects/def-rsdjjana/ruism/Dreamer_v2_AEH/results/randomizedreacherloca_v2_state_ae_10seeds/%A-%a.err
 
 set -e -o pipefail
 
 # Top-level results dir on Lustre
-BASE_SAVE_DIR="$HOME/projects/def-rsdjjana/ruism/Dreamer_v2_AEH/results/randomizedreacherloca_v2_state_ae"
+BASE_SAVE_DIR="$HOME/projects/def-rsdjjana/ruism/Dreamer_v2_AEH/results/randomizedreacherloca_v2_state_ae_10seeds"
 mkdir -p "$BASE_SAVE_DIR"
 
 # Gentle stagger so all tasks don’t hammer Lustre at once
@@ -77,7 +77,7 @@ cd "$RUN_DIR"
 python -u "$DREAMER_SRC/dreamer.py" \
   --env randomizedreacherloca-easy \
   --algo Dreamerv2 \
-  --exp-name randomizedreacherloca_v2_state_ae \
+  --exp-name randomizedreacherloca_v2_state_ae_10seeds \
   --train \
   --loca-all-phases \
   --buffer-size 2500000 \
